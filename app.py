@@ -3,6 +3,7 @@ import io
 import time
 import zipfile
 import urllib.request
+import gc
 from pathlib import Path
 import streamlit as st
 import cv2
@@ -47,12 +48,25 @@ def download_model(model_type="full"):
 
 # Helper functions
 def load_image(uploaded_file):
-    """Loads uploaded image, auto-resolving EXIF orientation so it appears upright."""
+    """Loads uploaded image, auto-resolving EXIF orientation, and downscales if too large to save memory."""
     try:
         pil_img = Image.open(uploaded_file)
         pil_img = ImageOps.exif_transpose(pil_img)
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
+            
+        # Downscale image if dimensions exceed 2000px to avoid Out Of Memory (OOM) on Streamlit Cloud
+        max_dim = 2000
+        w, h = pil_img.size
+        if w > max_dim or h > max_dim:
+            if w > h:
+                new_w = max_dim
+                new_h = int(h * (max_dim / w))
+            else:
+                new_h = max_dim
+                new_w = int(w * (max_dim / h))
+            pil_img = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            
         # Convert PIL (RGB) to OpenCV (BGR)
         open_cv_image = np.array(pil_img)
         open_cv_image = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2BGR)
@@ -149,7 +163,7 @@ def crop_face_to_pasfoto(image, bbox, target_w, target_h, face_ratio, vertical_p
 st.title("📸 AutoCrop Pasfoto 3x4 (Manual Rotate)")
 st.markdown(
     """
-    Aplikasi web pintar berbasis AI untuk mendeteksi wajah secara otomatis dan memotong (crop) foto Anda menjadi pasfoto standar resmi. **Anda bisa memutar kemiringan foto secara manual di panel kiri (rotasi sederhana pada poros tengah gambar).**
+    Aplikasi web pintar berbasis AI untuk mendeteksi wajah secara otomatis dan memotong (crop) foto Anda menjadi pasfoto standar resmi. **Versi ini dioptimalkan dengan kompresi memori agar berjalan sangat stabil di server cloud.**
     """
 )
 
@@ -372,6 +386,29 @@ with tab_single:
                         file_name=f"pasfoto_3x4_{base_name}.png",
                         mime="image/png"
                     )
+            
+            # Explicit cleanup for Tab 1
+            try: del img
+            except NameError: pass
+            try: del processed_img
+            except NameError: pass
+            try: del final_rgb
+            except NameError: pass
+            try: del mp_final
+            except NameError: pass
+            try: del final_results
+            except NameError: pass
+            try: del final_det
+            except NameError: pass
+            try: del cropped_img
+            except NameError: pass
+            try: del vis_img
+            except NameError: pass
+            try: del vis_img_pil
+            except NameError: pass
+            try: del cropped_img_pil
+            except NameError: pass
+            gc.collect()
 
 # ----------------- TAB 2: BATCH PROCESSING -----------------
 with tab_batch:
@@ -397,71 +434,103 @@ with tab_batch:
             success_count = 0
             fail_count = 0
             
-            cropped_previews = []
+            # Create preview area before loop (Memory-Efficient Rendering)
+            st.markdown("### Preview Hasil Batch")
+            cols_grid = st.columns(4)
             
             with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
                 for i, u_file in enumerate(batch_files):
                     status_text.text(f"Memproses ({i+1}/{len(batch_files)}): {u_file.name}")
                     
-                    img = load_image(u_file)
-                    if img is not None:
-                        # Apply manual rotation on the original image (around center) if angle != 0.0
-                        processed_img = img.copy()
-                        if rotation_val != 0.0:
-                            processed_img = rotate_image_around_center(img, rotation_val, padding_color_bgr)
-                                
-                        # Run final face detection on processed image
-                        final_rgb = cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB)
-                        mp_final = mp.Image(image_format=mp.ImageFormat.SRGB, data=final_rgb)
-                        final_results = detector.detect(mp_final)
+                    col_grid = cols_grid[i % 4]
+                    with col_grid:
+                        st.write(f"**{u_file.name}**")
                         
-                        if final_results.detections:
-                            final_det = get_largest_detection(final_results.detections)
+                        img = load_image(u_file)
+                        if img is not None:
+                            # Apply manual rotation on the original image (around center) if angle != 0.0
+                            processed_img = img.copy()
+                            if rotation_val != 0.0:
+                                processed_img = rotate_image_around_center(img, rotation_val, padding_color_bgr)
+                                    
+                            # Run final face detection on processed image
+                            final_rgb = cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB)
+                            mp_final = mp.Image(image_format=mp.ImageFormat.SRGB, data=final_rgb)
+                            final_results = detector.detect(mp_final)
                             
-                            img_h, img_w, _ = processed_img.shape
-                            fkp0 = final_det.keypoints[0]
-                            fkp1 = final_det.keypoints[1]
-                            fx1 = fkp0.x * img_w
-                            fx2 = fkp1.x * img_w
-                            f_eye_cx = (fx1 + fx2) / 2
-                            
-                            crop_cx = (center_weight * f_eye_cx) + ((1.0 - center_weight) * (img_w / 2))
-                            
-                            cropped_img, _ = crop_face_to_pasfoto(
-                                image=processed_img,
-                                bbox=final_det.bounding_box,
-                                target_w=target_w,
-                                target_h=target_h,
-                                face_ratio=face_ratio,
-                                vertical_pos=vertical_pos,
-                                padding_color_bgr=padding_color_bgr,
-                                custom_cx=crop_cx,
-                                custom_cy_offset=0
-                            )
-                            
-                            # Convert to bytes
-                            cropped_rgb = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB)
-                            pil_cropped = Image.fromarray(cropped_rgb)
-                            
-                            img_byte_arr = io.BytesIO()
-                            pil_cropped.save(img_byte_arr, format="PNG")
-                            img_byte_arr = img_byte_arr.getvalue()
-                            
-                            # Add to ZIP
-                            base_name = Path(u_file.name).stem
-                            zip_file.writestr(f"pasfoto_3x4_{base_name}.png", img_byte_arr)
-                            
-                            # Store preview info
-                            cropped_previews.append((u_file.name, pil_cropped, "Sukses"))
-                            success_count += 1
+                            if final_results.detections:
+                                final_det = get_largest_detection(final_results.detections)
+                                
+                                img_h, img_w, _ = processed_img.shape
+                                fkp0 = final_det.keypoints[0]
+                                fkp1 = final_det.keypoints[1]
+                                fx1 = fkp0.x * img_w
+                                fx2 = fkp1.x * img_w
+                                f_eye_cx = (fx1 + fx2) / 2
+                                
+                                crop_cx = (center_weight * f_eye_cx) + ((1.0 - center_weight) * (img_w / 2))
+                                
+                                cropped_img, _ = crop_face_to_pasfoto(
+                                    image=processed_img,
+                                    bbox=final_det.bounding_box,
+                                    target_w=target_w,
+                                    target_h=target_h,
+                                    face_ratio=face_ratio,
+                                    vertical_pos=vertical_pos,
+                                    padding_color_bgr=padding_color_bgr,
+                                    custom_cx=crop_cx,
+                                    custom_cy_offset=0
+                                )
+                                
+                                # Convert to bytes
+                                cropped_rgb = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB)
+                                pil_cropped = Image.fromarray(cropped_rgb)
+                                
+                                img_byte_arr = io.BytesIO()
+                                pil_cropped.save(img_byte_arr, format="PNG")
+                                img_byte_arr_data = img_byte_arr.getvalue()
+                                
+                                # Add to ZIP
+                                base_name = Path(u_file.name).stem
+                                zip_file.writestr(f"pasfoto_3x4_{base_name}.png", img_byte_arr_data)
+                                
+                                # Display immediately to free memory sooner
+                                st.image(pil_cropped, use_container_width=True)
+                                st.caption("✅ Sukses")
+                                success_count += 1
+                            else:
+                                st.error("❌ Wajah Tidak Terdeteksi")
+                                fail_count += 1
                         else:
-                            cropped_previews.append((u_file.name, None, "Wajah Tidak Terdeteksi"))
+                            st.error("❌ Gagal Membaca File")
                             fail_count += 1
-                    else:
-                        cropped_previews.append((u_file.name, None, "Gagal Membaca File"))
-                        fail_count += 1
                         
                     progress_bar.progress((i + 1) / len(batch_files))
+                    
+                    # Clean up local variables immediately to free RAM
+                    try: del img
+                    except NameError: pass
+                    try: del processed_img
+                    except NameError: pass
+                    try: del final_rgb
+                    except NameError: pass
+                    try: del mp_final
+                    except NameError: pass
+                    try: del final_results
+                    except NameError: pass
+                    try: del final_det
+                    except NameError: pass
+                    try: del cropped_img
+                    except NameError: pass
+                    try: del cropped_rgb
+                    except NameError: pass
+                    try: del pil_cropped
+                    except NameError: pass
+                    try: del img_byte_arr
+                    except NameError: pass
+                    try: del img_byte_arr_data
+                    except NameError: pass
+                    gc.collect()
             
             status_text.text("Pemrosesan massal selesai!")
             
@@ -477,16 +546,3 @@ with tab_batch:
                     file_name="pasfoto_cropped_batch.zip",
                     mime="application/zip"
                 )
-                
-            # Display preview grid
-            st.markdown("### Preview Hasil Batch")
-            cols_grid = st.columns(4)
-            for idx, (name, preview_img, status) in enumerate(cropped_previews):
-                col_grid = cols_grid[idx % 4]
-                with col_grid:
-                    st.write(f"**{name}**")
-                    if status == "Sukses" and preview_img is not None:
-                        st.image(preview_img, use_container_width=True)
-                        st.caption("✅ Sukses")
-                    else:
-                        st.error(f"❌ {status}")
